@@ -61,9 +61,9 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
     async def search_documents(
         question: str,
         top_k: int = 10,
-        application: str | None = None,
-        domain: str | None = None,
-        access_group: str | None = None,
+        application: str | list[str] | None = None,
+        domain: str | list[str] | None = None,
+        access_group: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Search the knowledge base and return relevant document chunks.
@@ -75,9 +75,16 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
         Args:
             question:     The search question or query.
             top_k:        Number of chunks to return (1–20, default 10).
-            application:  Filter by application name e.g. "Smart Pricing Tool".
-            domain:       Filter by domain e.g. "XLOS", "EIT".
-            access_group: Filter by access group e.g. "general", "restricted".
+            application:  Filter by application name. Single value or list.
+                          e.g. "Smart Pricing Tool"
+                          or   ["Smart Pricing Tool", "Flex Forecast"]
+                          Use list when comparing across multiple applications.
+            domain:       Filter by domain. Single or list.
+                          e.g. "XLOS" or ["XLOS", "EIT"]
+            access_group: Filter by access group. Single or list.
+                          e.g. "general" or ["general", "restricted"]
+                          Use list for privileged users who can see
+                          both general and restricted documents.
 
         Returns:
             Dictionary with:
@@ -126,9 +133,9 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
     async def query_knowledge_base(
         question: str,
         top_k: int = 10,
-        application: str | None = None,
-        domain: str | None = None,
-        access_group: str | None = None,
+        application: str | list[str] | None = None,
+        domain: str | list[str] | None = None,
+        access_group: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Ask a question and get a direct answer from the knowledge base.
@@ -140,9 +147,16 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
         Args:
             question:     The question to answer.
             top_k:        Number of context chunks to use (1–20, default 10).
-            application:  Filter by application name e.g. "Smart Pricing Tool".
-            domain:       Filter by domain e.g. "XLOS", "EIT".
-            access_group: Filter by access group e.g. "general", "restricted".
+            application:  Filter by application name. Single value or list.
+                          e.g. "Smart Pricing Tool"
+                          or   ["Smart Pricing Tool", "Flex Forecast"]
+                          Use list when question spans multiple applications.
+            domain:       Filter by domain. Single or list.
+                          e.g. "XLOS" or ["XLOS", "EIT"]
+            access_group: Filter by access group. Single or list.
+                          e.g. "general" or ["general", "restricted"]
+                          Pass list for privileged users who can see
+                          both general and restricted documents.
 
         Returns:
             Dictionary with:
@@ -266,23 +280,43 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
 
 
 def _build_filters(
-    application: str | None,
-    domain: str | None,
-    access_group: str | None,
+    application: str | list[str] | None,
+    domain: str | list[str] | None,
+    access_group: str | list[str] | None,
 ) -> SearchFilters:
     """
-    Build SearchFilters from flat tool parameters.
+    Build SearchFilters from tool parameters.
 
-    Agent passes single values per dimension (simpler interface).
-    SearchFilters expects dict[str, list[str]] (multi-value OR).
-    Convert: application="SPT" → filters={"application": ["SPT"]}
+    Accepts single string or list of strings per dimension.
+    SearchFilters expects dict[str, list[str]] — always normalise to list.
+
+    Examples:
+      application="SPT"                         → {"application": ["SPT"]}
+      application=["SPT", "Flex Forecast"]      → {"application": ["SPT", "Flex Forecast"]}
+      access_group=["general", "restricted"]    → {"access_group": ["general", "restricted"]}
+
+    Within a field: values are ORed (match ANY).
+    Across fields: fields are ANDed (match ALL dimensions).
     """
     raw: dict[str, list[str]] = {}
-    if application:
-        raw["application"] = [application]
-    if domain:
-        raw["domain"] = [domain]
-    if access_group:
-        raw["access_group"] = [access_group]
+
+    def _to_list(val: str | list[str] | None) -> list[str]:
+        """Normalise str | list[str] | None → list[str]."""
+        if val is None:
+            return []
+        if isinstance(val, str):
+            return [val]
+        return [v for v in val if v]  # filter empty strings
+
+    app_list = _to_list(application)
+    dom_list = _to_list(domain)
+    ag_list = _to_list(access_group)
+
+    if app_list:
+        raw["application"] = app_list
+    if dom_list:
+        raw["domain"] = dom_list
+    if ag_list:
+        raw["access_group"] = ag_list
 
     return SearchFilters(filters=raw)
