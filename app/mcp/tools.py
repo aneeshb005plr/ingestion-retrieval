@@ -1,36 +1,38 @@
 """
 MCP Tools — the 3 tools exposed to AI agents.
 
-Each tool is a plain async function.
-FastMCP reads:
-  - Function name      → tool name
-  - Docstring          → tool description (shown to AI agent)
-  - Type hints         → input/output schema (auto-generated)
+Design principle: GENERAL PURPOSE — not tied to any specific tenant.
 
-Why 3 tools and not 1?
-  search_documents   → agent wants RAW chunks (inspect, compare, filter itself)
-  query_knowledge_base → agent wants DIRECT ANSWER (most common — DocAssist)
-  list_repos         → agent discovers what knowledge bases exist before searching
+Each tenant has its own filterable_fields and extractable_fields.
+Tools use a generic filters dict so any tenant can filter by
+their own field names without code changes.
 
-These map 1:1 to existing REST endpoints — no new logic, just a different
-interface layer that AI agents understand natively.
+Agent workflow:
+  1. list_repos()
+     → discovers available knowledge bases + filterable_fields
+     → learns what filter keys to use for this tenant
+
+  2. search_documents(question, filters={...})
+     OR query_knowledge_base(question, filters={...})
+     → passes filters using field names from list_repos()
+
+Examples across tenants:
+  DocAssist:   filters={"application": "Smart Pricing Tool", "domain": "XLOS"}
+  SmartQuery:  filters={"table_name": "customers", "schema_name": "sales"}
+  HR:          filters={"department": "Finance", "policy_type": "leave"}
+  Finance:     filters={"business_unit": "Tax", "quarter": "Q1"}
+
+Filter semantics:
+  Values within a field → ORed  (match ANY value)
+  Fields across dims    → ANDed (match ALL dimensions)
+
+  {"application": ["SPT", "Flex Forecast"], "domain": "XLOS"}
+  → (app=SPT OR app=Flex Forecast) AND domain=XLOS
 
 Tenant scoping:
-  Tools are registered per-tenant at server mount time.
-  tenant_id is captured via closure — tool calls never pass tenant_id.
-  Security: one MCP mount = one tenant = one data boundary.
-
-Filter format (agent-friendly, flat):
-  {
-    "application": "Smart Pricing Tool",   ← single value, string
-    "domain": "XLOS",
-    "access_group": "general"
-  }
-
-  Deliberately simpler than the REST API dict[str, list[str]]:
-  - Agents pass one value per dimension — not multi-value OR lists
-  - Multi-value access control (general + restricted) handled by caller
-  - Converted to SearchFilters internally before calling retrieval service
+  tenant_id baked in via closure at mount time.
+  Tool calls never need to pass tenant_id.
+  One MCP mount = one tenant = one data boundary.
 """
 
 from typing import Any
@@ -48,22 +50,14 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
     """
     Factory that returns the 3 tool functions pre-scoped to a tenant.
 
-    Using a factory with closure keeps tool functions clean:
-      - No tenant_id parameter needed in each tool
-      - Tool docstrings stay agent-readable (no internal params)
-      - Security: tenant is baked in, cannot be overridden by caller
-
     Returns:
         Tuple of (search_documents, query_knowledge_base, list_repos)
-        to be registered with FastMCP.
     """
 
     async def search_documents(
         question: str,
+        filters: dict[str, str | list[str]] | None = None,
         top_k: int = 10,
-        application: str | list[str] | None = None,
-        domain: str | list[str] | None = None,
-        access_group: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Search the knowledge base and return relevant document chunks.
@@ -72,42 +66,48 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
         documents. Returns raw chunks with similarity scores — useful
         when you want to inspect multiple sources or compare information.
 
+        Call list_repos first to discover what filter fields are available
+        for this tenant before applying filters.
+
         Args:
-            question:     The search question or query.
-            top_k:        Number of chunks to return (1–20, default 10).
-            application:  Filter by application name. Single value or list.
-                          e.g. "Smart Pricing Tool"
-                          or   ["Smart Pricing Tool", "Flex Forecast"]
-                          Use list when comparing across multiple applications.
-            domain:       Filter by domain. Single or list.
-                          e.g. "XLOS" or ["XLOS", "EIT"]
-            access_group: Filter by access group. Single or list.
-                          e.g. "general" or ["general", "restricted"]
-                          Use list for privileged users who can see
-                          both general and restricted documents.
+            question: The search question or query.
+            filters:  Optional metadata filters as a dictionary.
+                      Keys are field names specific to this tenant.
+                      Values can be a single string or list of strings.
+                      Multiple values within a field are ORed.
+                      Multiple fields are ANDed.
+
+                      Examples:
+                        {"application": "Smart Pricing Tool"}
+                        {"application": ["SPT", "Flex Forecast"]}
+                        {"table_name": "customers"}
+                        {"department": "Finance", "region": "US"}
+                        {"access_group": ["general", "restricted"]}
+
+            top_k:    Number of chunks to return (1-20, default 10).
 
         Returns:
             Dictionary with:
-              chunks:    List of relevant document chunks with scores
-              total:     Number of chunks found
-              question:  The original question
+              chunks:          List of relevant document chunks with scores
+              total:           Number of chunks found
+              question:        The original question
+              skipped_filters: Filter fields not supported by any repo
         """
         log.info(
             "mcp.search_documents",
             tenant_id=tenant_id,
             question=question[:80],
+            filters=filters,
             top_k=top_k,
-            application=application,
-            domain=domain,
         )
 
-        filters = _build_filters(application, domain, access_group)
+        search_filters = _build_filters(filters)
 
         try:
             chunks, skipped = await retrieval_service.search(
                 question=question,
                 tenant_id=tenant_id,
-                filters=filters,
+                filters=search_filters,
                 top_k=top_k,
             )
 
@@ -128,14 +128,17 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
             }
         except Exception as e:
             log.error("mcp.search_documents.error", tenant_id=tenant_id, error=str(e))
-            return {"error": str(e), "question": question, "total": 0, "chunks": []}
+            return {
+                "error": str(e),
+                "question": question,
+                "total": 0,
+                "chunks": [],
+            }
 
     async def query_knowledge_base(
         question: str,
+        filters: dict[str, str | list[str]] | None = None,
         top_k: int = 10,
-        application: str | list[str] | None = None,
-        domain: str | list[str] | None = None,
-        access_group: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Ask a question and get a direct answer from the knowledge base.
@@ -144,42 +147,48 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
         Searches the knowledge base, retrieves relevant context,
         and uses an LLM to generate a grounded, accurate answer.
 
+        Call list_repos first to discover what filter fields are available
+        for this tenant before applying filters.
+
         Args:
-            question:     The question to answer.
-            top_k:        Number of context chunks to use (1–20, default 10).
-            application:  Filter by application name. Single value or list.
-                          e.g. "Smart Pricing Tool"
-                          or   ["Smart Pricing Tool", "Flex Forecast"]
-                          Use list when question spans multiple applications.
-            domain:       Filter by domain. Single or list.
-                          e.g. "XLOS" or ["XLOS", "EIT"]
-            access_group: Filter by access group. Single or list.
-                          e.g. "general" or ["general", "restricted"]
-                          Pass list for privileged users who can see
-                          both general and restricted documents.
+            question: The question to answer.
+            filters:  Optional metadata filters as a dictionary.
+                      Keys are field names specific to this tenant.
+                      Values can be a single string or list of strings.
+                      Multiple values within a field are ORed.
+                      Multiple fields are ANDed.
+
+                      Examples:
+                        {"application": "Smart Pricing Tool"}
+                        {"application": ["SPT", "Flex Forecast"]}
+                        {"table_name": "customers"}
+                        {"access_group": ["general", "restricted"]}
+
+            top_k:    Number of context chunks to use (1-20, default 10).
 
         Returns:
             Dictionary with:
-              answer:  Direct answer to the question
-              sources: List of source documents used to generate the answer
+              answer:       Direct answer grounded in retrieved documents
+              sources:      Source documents used to generate the answer
               total_chunks: Number of chunks used as context
+              question:     The original question
         """
         log.info(
             "mcp.query_knowledge_base",
             tenant_id=tenant_id,
             question=question[:80],
+            filters=filters,
             top_k=top_k,
-            application=application,
         )
 
-        filters = _build_filters(application, domain, access_group)
+        search_filters = _build_filters(filters)
 
         try:
             # Step 1 — retrieve chunks
             chunks, _ = await retrieval_service.search(
                 question=question,
                 tenant_id=tenant_id,
-                filters=filters,
+                filters=search_filters,
                 top_k=top_k,
             )
 
@@ -217,7 +226,7 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
                         "file_name": c.get("file_name", ""),
                         "source_url": c.get("source_url", ""),
                         "score": round(c.get("score", 0.0), 4),
-                        "text": c.get("text", "")[:300],  # preview only
+                        "text": c.get("text", "")[:300],
                     }
                     for c in chunks
                 ],
@@ -240,13 +249,18 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
         List all available knowledge base repositories for this tenant.
 
         Use this tool to discover what knowledge bases are available
-        before searching. Returns repository names, types, and the
-        filter fields you can use to narrow searches.
+        and what filter fields you can use before searching.
+
+        The filterable_fields show what keys you can pass in the
+        filters parameter of search_documents and query_knowledge_base.
+
+        The extractable_fields show which fields the system can
+        automatically infer from the question text without explicit filters.
 
         Returns:
             Dictionary with:
-              repos:  List of available knowledge base repositories
-              total:  Number of repositories
+              repos:  List of repositories with their filter fields
+              total:  Number of available repositories
         """
         log.info("mcp.list_repos", tenant_id=tenant_id)
 
@@ -280,43 +294,34 @@ def make_tools(tenant_id: str, retrieval_service: RetrievalService):
 
 
 def _build_filters(
-    application: str | list[str] | None,
-    domain: str | list[str] | None,
-    access_group: str | list[str] | None,
+    filters: dict[str, str | list[str]] | None,
 ) -> SearchFilters:
     """
-    Build SearchFilters from tool parameters.
+    Build SearchFilters from the generic filters dict.
 
-    Accepts single string or list of strings per dimension.
-    SearchFilters expects dict[str, list[str]] — always normalise to list.
+    Normalises each value to list[str] — SearchFilters expects
+    dict[str, list[str]] but tool accepts str for convenience.
 
     Examples:
-      application="SPT"                         → {"application": ["SPT"]}
-      application=["SPT", "Flex Forecast"]      → {"application": ["SPT", "Flex Forecast"]}
-      access_group=["general", "restricted"]    → {"access_group": ["general", "restricted"]}
-
-    Within a field: values are ORed (match ANY).
-    Across fields: fields are ANDed (match ALL dimensions).
+      {"application": "SPT"}                    → {"application": ["SPT"]}
+      {"application": ["SPT", "Flex Forecast"]} → {"application": ["SPT", "Flex Forecast"]}
+      {"access_group": ["general","restricted"]} → {"access_group": ["general","restricted"]}
+      None                                       → {}
     """
-    raw: dict[str, list[str]] = {}
+    if not filters:
+        return SearchFilters(filters={})
 
-    def _to_list(val: str | list[str] | None) -> list[str]:
-        """Normalise str | list[str] | None → list[str]."""
-        if val is None:
-            return []
-        if isinstance(val, str):
-            return [val]
-        return [v for v in val if v]  # filter empty strings
+    normalised: dict[str, list[str]] = {}
 
-    app_list = _to_list(application)
-    dom_list = _to_list(domain)
-    ag_list = _to_list(access_group)
+    for field, value in filters.items():
+        if not field or not value:
+            continue
+        if isinstance(value, str):
+            normalised[field] = [value]
+        elif isinstance(value, list):
+            # Filter out empty strings
+            clean = [v for v in value if v and isinstance(v, str)]
+            if clean:
+                normalised[field] = clean
 
-    if app_list:
-        raw["application"] = app_list
-    if dom_list:
-        raw["domain"] = dom_list
-    if ag_list:
-        raw["access_group"] = ag_list
-
-    return SearchFilters(filters=raw)
+    return SearchFilters(filters=normalised)
