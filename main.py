@@ -24,6 +24,7 @@ from app.db.mongo import connect_to_mongo, close_mongo
 from app.api.dependencies import init_singletons, shutdown_singletons
 from app.api.health import router as health_router
 from app.api.routes import router as api_router
+from app.mcp.server import mount_mcp_servers
 
 log = structlog.get_logger(__name__)
 
@@ -39,6 +40,9 @@ async def lifespan(app: FastAPI):
     )
     await connect_to_mongo()
     init_singletons()  # VectorStoreProvider + FilterBuilder
+    # Mount one MCP server per active tenant at /mcp/{tenant_id}
+    # Must run AFTER init_singletons() — tools need vector store + filter builder
+    await mount_mcp_servers(app)
     log.info("retrieval_service.ready")
     yield
     # ── Shutdown ──────────────────────────────────────────────────
@@ -57,6 +61,4 @@ app = FastAPI(
 
 # ── Routes ────────────────────────────────────────────────────────
 app.include_router(health_router)
-
 app.include_router(api_router)
-# MCP server mounted in Phase R4

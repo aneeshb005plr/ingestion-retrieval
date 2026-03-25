@@ -41,3 +41,13 @@ class TenantRepository(BaseRepository):
 
         log.debug("tenant_repo.fetched", tenant_id=tenant_id)
         return doc
+
+    async def list_active(self) -> list[dict]:
+        """
+        Return all active tenants.
+        Called at startup to mount one MCP server per tenant.
+        """
+        cursor = self.collection.find({"is_active": True})
+        tenants = await cursor.to_list(length=None)
+        log.debug("tenant_repo.list_active", count=len(tenants))
+        return tenants
