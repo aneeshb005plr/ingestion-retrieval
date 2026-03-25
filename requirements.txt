@@ -1,0 +1,37 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# retrieval-service — Python 3.13
+# Last updated: Mar 17 2026
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Web Framework ─────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# ── Data Validation ───────────────────────────────────────────────────────────
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+
+# ── Database ──────────────────────────────────────────────────────────────────
+pymongo>=4.10.0                     # langchain-mongodb needs >=4.6.1, using 4.10+ for async
+
+# ── LangChain ─────────────────────────────────────────────────────────────────
+langchain-core>=1.2.5
+langchain-openai>=1.1.0             # ChatOpenAI (LLM) + OpenAIEmbeddings
+langchain-mongodb>=0.11.0           # MongoDBAtlasVectorSearch similarity_search()
+pymongo-search-utils>=0.2.1         # required by langchain-mongodb>=0.11.0
+lark>=1.1.9,<2.0.0                  # required by langchain-mongodb>=0.11.0
+
+# ── MCP Server ────────────────────────────────────────────────────────────────
+fastmcp>=3.1.1                      # MCP server — Streamable HTTP transport
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+structlog>=24.4.0
+
+# ── Security & Encryption ─────────────────────────────────────────────────────
+cryptography>=42.0.0                # Fernet AES decrypt for tenant genai_api_key
+# Uncomment for AKS Key Vault support:
+# azure-keyvault-secrets>=4.7.0
+# azure-identity>=1.15.0
+
+# ── API Docs ──────────────────────────────────────────────────────────────────
+scalar-fastapi>=1.0.0
