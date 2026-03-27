@@ -1,30 +1,28 @@
 """
-MCP Server — per-tenant MCP via registry + proxy + combined lifespans.
+MCP Server — per-tenant MCP via registry + proxy.
 
 Key requirement (per FastMCP docs):
   "Always pass the lifespan context when mounting MCP servers"
   mcp_app.lifespan MUST be entered for session manager to initialise.
 
 Architecture:
-  1. build_mcp_apps() — builds all tenant mcp_apps at startup
-     Returns: list of mcp_apps with their lifespans
-     Called BEFORE FastAPI() is created
+  1. build_startup_mcp_apps()
+     Reads active tenants from MongoDB, builds one mcp_app per tenant.
+     Populates registry for proxy routing.
+     Returns list of (tenant_id, mcp_app) tuples.
+     Called from main.py lifespan AFTER init_singletons().
 
-  2. get_combined_lifespan() — combines all mcp_app lifespans +
-     the app's own lifespan (MongoDB, singletons) using combine_lifespans
-     Passed as lifespan= to FastAPI()
+  2. main.py lifespan enters each mcp_app.lifespan via AsyncExitStack:
+       async with contextlib.AsyncExitStack() as stack:
+           for tenant_id, mcp_app in tenant_apps:
+               await stack.enter_async_context(mcp_app.lifespan(mcp_app))
 
-  3. MCPProxy mounted at /mcp — routes requests to registry by tenant_id
-     Registry populated during combined lifespan startup
+  3. MCPProxy mounted at /mcp routes requests to registry by tenant_id.
+     Registry populated in step 1.
 
-  4. activate_tenant() / deactivate_tenant() — runtime management
-     activate: builds new mcp_app, enters lifespan manually, adds to registry
-     deactivate: removes from registry (lifespan stays running until shutdown)
-
-Note on dynamic activate after startup:
-  For tenants activated after startup, we use a background task approach
-  — the mcp_app lifespan is entered within the activation coroutine
-  using anyio task scope. See activate_tenant() for details.
+  4. activate_tenant() / deactivate_tenant() — runtime management.
+     deactivate: instant registry removal, no restart needed.
+     activate: builds new mcp_app, adds to registry.
 
 Endpoints:
   /mcp/{tenant_id}/mcp        ← MCP tool calls
@@ -33,11 +31,9 @@ Endpoints:
   /admin/mcp/{id}/deactivate  ← deactivate tenant
 """
 
-import contextlib
 import structlog
 from fastapi import FastAPI
 from fastmcp import FastMCP
-from fastmcp.utilities.lifespan import combine_lifespans
 
 from app.db.mongo import get_database
 from app.repositories.tenant_repo import TenantRepository
@@ -55,17 +51,18 @@ from app.mcp.proxy import MCPProxy
 
 log = structlog.get_logger(__name__)
 
-# Store mcp_apps built at startup for lifespan management
-_startup_mcp_apps: list = []
 
-
-async def build_startup_mcp_apps() -> list:
+async def build_startup_mcp_apps() -> list[tuple[str, object]]:
     """
     Build mcp_app for every active tenant.
-    Called BEFORE FastAPI() is created so lifespans can be combined.
 
-    Returns list of (tenant_id, mcp_app) tuples.
-    Also populates registry for proxy routing.
+    Called from main.py lifespan after init_singletons() so
+    VectorStore and FilterBuilder are available.
+
+    Returns:
+        list of (tenant_id, mcp_app) tuples.
+        mcp_app lifespans are entered by main.py lifespan
+        via AsyncExitStack.
     """
     db = get_database()
     tenant_repo = TenantRepository(db)
@@ -82,32 +79,11 @@ async def build_startup_mcp_apps() -> list:
         except Exception as e:
             log.error("mcp.tenant_build_failed", tenant_id=tenant_id, error=str(e))
 
-    global _startup_mcp_apps
-    _startup_mcp_apps = apps
     return apps
 
 
-def get_combined_lifespan(app_lifespan):
-    """
-    Combine app lifespan with all tenant mcp_app lifespans.
-
-    Per FastMCP docs:
-      from fastmcp.utilities.lifespan import combine_lifespans
-      app = FastAPI(lifespan=combine_lifespans(app_lifespan, mcp_app.lifespan))
-
-    Called after build_startup_mcp_apps() to get all mcp_app lifespans.
-    """
-    mcp_lifespans = [mcp_app.lifespan for _, mcp_app in _startup_mcp_apps]
-
-    if not mcp_lifespans:
-        # No active tenants — just use app lifespan
-        return app_lifespan
-
-    return combine_lifespans(app_lifespan, *mcp_lifespans)
-
-
 def mount_proxy(app: FastAPI) -> None:
-    """Mount MCPProxy at /mcp. Called after FastAPI app is created."""
+    """Mount MCPProxy at /mcp. Called from create_app() in main.py."""
     app.mount("/mcp", MCPProxy())
     log.info("mcp.proxy_mounted", path="/mcp")
 
@@ -115,12 +91,12 @@ def mount_proxy(app: FastAPI) -> None:
 async def activate_tenant(tenant_id: str, db=None) -> None:
     """
     Build and register a tenant MCP app at runtime (after startup).
-    For post-startup activation, we mount the mcp_app directly — the
-    lifespan is managed by the mcp_app itself when stateless_http=True.
+    Called from admin API when a tenant is re-activated.
 
-    Note: For stateless_http=True, the session manager initialises
-    per-request rather than requiring a persistent lifespan context.
-    This is why dynamic activation works without combine_lifespans.
+    Note: post-startup activations do not have their lifespan entered
+    via AsyncExitStack. stateless_http=True means the session manager
+    initialises per-request — no persistent lifespan context needed
+    for dynamic activations.
     """
     if db is None:
         db = get_database()
@@ -171,6 +147,6 @@ def _build_tenant_mcp_app(tenant_id: str, db) -> object:
     mcp.tool()(query_fn)
     mcp.tool()(list_fn)
 
-    # stateless_http=True — no persistent session state needed
+    # stateless_http=True — each tool call is independent, no session state
     mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
     return mcp_app
