@@ -37,6 +37,7 @@ from app.repositories.tenant_repo import TenantRepository
 from app.repositories.repo_repo import RepoRepository
 from app.services.filter_builder import FilterBuilder
 from app.services.filter_extractor import FilterExtractor
+from app.services.reranker import Reranker
 from app.schemas.search import SearchFilters
 
 log = structlog.get_logger(__name__)
@@ -59,6 +60,7 @@ class RetrievalService:
         self._filter_builder = filter_builder
         self._embedding_factory = embedding_factory
         self._filter_extractor = filter_extractor
+        self._reranker = Reranker()
 
     async def search(
         self,
@@ -156,10 +158,14 @@ class RetrievalService:
         )
 
         # ── Step 4: Search each repo concurrently ─────────────────────────────
-        # Fetch top_k per repo — numCandidates in the pipeline already
-        # handles wide HNSW graph traversal. per_repo_k = top_k is enough
-        # since we merge and re-rank across repos afterwards.
-        per_repo_k = top_k
+        # Fetch vector_top_k per repo — wider than top_k to give reranker
+        # enough candidates. Reranker then selects the best top_k.
+        #
+        # vector_top_k = top_k * 3, capped at 30:
+        #   Gives reranker 3x more candidates than needed
+        #   Cap at 30 to control reranker LLM token cost
+        #   30 chunks × ~500 tokens = ~15k tokens per rerank call
+        vector_top_k = min(max(top_k * 3, 20), 30)
 
         async def search_repo(repo: dict) -> tuple[list[dict], list[str]]:
             repo_id = repo["_id"]
@@ -207,7 +213,7 @@ class RetrievalService:
                     question_vector=question_vector,
                     normalised_filter=normalised_filter,
                     index_name=index_name,
-                    top_k=per_repo_k,
+                    top_k=vector_top_k,
                     # Hybrid search params — ignored if hybrid_search_enabled=False
                     question=question,
                     hybrid_search_enabled=hybrid_enabled,
@@ -241,9 +247,21 @@ class RetrievalService:
             all_chunks.extend(chunks)
             all_skipped.update(skipped)
 
-        # Sort by score descending, return top_k
+        # Sort by vector score descending
         all_chunks.sort(key=lambda c: c.get("score", 0), reverse=True)
-        final = all_chunks[:top_k]
+
+        # ── Step 6: Rerank ────────────────────────────────────────────────────
+        # Vector similarity ranks by topic similarity — all chunks from the
+        # same application score similarly due to R6a prefix.
+        # Reranker reads (query + chunk) together and scores by answer relevance.
+        # Uses tenant's own LLM — no new API needed.
+        # Graceful degradation: if reranker fails → original vector ranking used.
+        final = await self._reranker.rerank(
+            question=question,
+            chunks=all_chunks,
+            top_k=top_k,
+            api_cfg=api_cfg,
+        )
 
         bound_log.info(
             "retrieval.search_complete",
