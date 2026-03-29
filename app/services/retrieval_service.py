@@ -191,11 +191,28 @@ class RetrievalService:
             )
 
             try:
+                # Read hybrid search config
+                # hybrid_search_enabled + hybrid_alpha → retrieval_config (generic)
+                # search_index_name → vector_config (provider-specific, Atlas)
+                retrieval_cfg = repo.get("retrieval_config", {})
+                vector_cfg = repo.get("vector_config", {})
+
+                hybrid_enabled = retrieval_cfg.get("hybrid_search_enabled", False)
+                hybrid_alpha = retrieval_cfg.get("hybrid_alpha", 0.7)
+                search_index = (
+                    vector_cfg.get("search_index_name") or f"sidx_repo_{repo_id}"
+                )
+
                 results = await self._vector_store.search(
                     question_vector=question_vector,
                     normalised_filter=normalised_filter,
                     index_name=index_name,
                     top_k=per_repo_k,
+                    # Hybrid search params — ignored if hybrid_search_enabled=False
+                    question=question,
+                    hybrid_search_enabled=hybrid_enabled,
+                    hybrid_alpha=hybrid_alpha,
+                    search_index_name=search_index,
                 )
                 # Convert SearchResult objects to dicts
                 chunks = [r.to_dict() for r in results]

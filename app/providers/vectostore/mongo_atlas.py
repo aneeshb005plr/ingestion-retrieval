@@ -192,35 +192,190 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
 
         return results
 
+    def _build_hybrid_pipeline(
+        self,
+        question: str,
+        question_vector: list[float],
+        vector_index_name: str,
+        search_index_name: str,
+        pre_filter: dict,
+        top_k: int,
+        alpha: float,
+    ) -> list[dict]:
+        """
+        Build hybrid search pipeline using $rankFusion.
+
+        Combines:
+          $vectorSearch  — semantic similarity (embedding-based)
+          $search        — BM25 full-text keyword matching
+
+        Scoring:
+          final_score = (alpha × vector_score) + ((1-alpha) × bm25_score)
+          alpha=0.7 → 70% semantic, 30% keyword (recommended default)
+
+        Why $rankFusion over manual score combination:
+          Atlas $rankFusion handles score normalization automatically.
+          Each pipeline returns ranked results independently.
+          $rankFusion combines rankings using Reciprocal Rank Fusion (RRF)
+          which is more robust than raw score arithmetic.
+
+        Atlas requirement:
+          Vector index: vidx_repo_{repo_id}  (already exists)
+          Search index: sidx_repo_{repo_id}  (must be created in Atlas UI)
+        """
+        num_candidates = max(top_k * 20, 150)
+
+        # Vector search pipeline
+        vector_pipeline: list[dict] = [
+            {
+                "$vectorSearch": {
+                    "index": vector_index_name,
+                    "path": EMBEDDING_KEY,
+                    "queryVector": question_vector,
+                    "numCandidates": num_candidates,
+                    "limit": top_k,
+                    **({"filter": pre_filter} if pre_filter else {}),
+                }
+            },
+            {"$set": {"score": {"$meta": "vectorSearchScore"}}},
+            {"$project": {EMBEDDING_KEY: 0}},
+        ]
+
+        # BM25 full-text search pipeline
+        # Searches the "text" field which contains the chunk content
+        # including R6a document identity prefix
+        bm25_pipeline: list[dict] = [
+            {
+                "$search": {
+                    "index": search_index_name,
+                    "text": {
+                        "query": question,
+                        "path": TEXT_KEY,
+                    },
+                }
+            },
+            {"$limit": top_k},
+            {"$set": {"score": {"$meta": "searchScore"}}},
+            {"$project": {EMBEDDING_KEY: 0}},
+        ]
+
+        # $rankFusion combines both pipelines
+        # weights control contribution of each pipeline
+        return [
+            {
+                "$rankFusion": {
+                    "input": {
+                        "pipelines": {
+                            "vector": vector_pipeline,
+                            "text": bm25_pipeline,
+                        }
+                    },
+                    "combination": {
+                        "weights": {
+                            "vector": alpha,
+                            "text": round(1.0 - alpha, 4),
+                        }
+                    },
+                }
+            },
+            {"$limit": top_k},
+            {"$set": {"score": {"$meta": "rankFusionScore"}}},
+            {"$project": {EMBEDDING_KEY: 0}},
+        ]
+
+    def _execute_hybrid_search(
+        self,
+        question: str,
+        question_vector: list[float],
+        vector_index_name: str,
+        search_index_name: str,
+        pre_filter: dict,
+        top_k: int,
+        alpha: float,
+    ) -> list[SearchResult]:
+        pipeline = self._build_hybrid_pipeline(
+            question=question,
+            question_vector=question_vector,
+            vector_index_name=vector_index_name,
+            search_index_name=search_index_name,
+            pre_filter=pre_filter,
+            top_k=top_k,
+            alpha=alpha,
+        )
+        results = []
+        for doc in self._collection.aggregate(pipeline):
+            text = doc.pop(TEXT_KEY, "")
+            score = doc.pop("score", 0.0)
+            repo_id = str(doc.pop("repo_id", ""))
+            doc.pop("_id", None)
+            doc.pop("tenant_id", None)
+            doc.pop(EMBEDDING_KEY, None)
+            results.append(
+                SearchResult(
+                    text=text,
+                    score=score,
+                    repo_id=repo_id,
+                    metadata=doc,
+                )
+            )
+        return results
+
     async def search(
         self,
         question_vector: list[float],
         normalised_filter: NormalisedFilter,
         index_name: str,
         top_k: int,
+        question: str = "",
+        hybrid_search_enabled: bool = False,
+        hybrid_alpha: float = 0.7,
+        search_index_name: str = "",
         **kwargs: Any,
     ) -> list[SearchResult]:
         """
-        Translate NormalisedFilter → MongoDB dict, execute $vectorSearch.
-        Runs sync pymongo aggregate() in thread pool — non-blocking.
+        Execute vector search or hybrid search depending on config.
+
+        Pure vector:  hybrid_search_enabled=False (default)
+        Hybrid:       hybrid_search_enabled=True
+                      Requires search_index_name and question.
         """
         pre_filter = self._translate_filter(normalised_filter)
 
         try:
-            results = await asyncio.to_thread(
-                self._execute_search,
-                question_vector,
-                index_name,
-                pre_filter,
-                top_k,
-            )
-            log.debug(
-                "vectorstore.searched",
-                index=index_name,
-                results=len(results),
-                top_k=top_k,
-                filter=normalised_filter.describe(),
-            )
+            if hybrid_search_enabled and question and search_index_name:
+                results = await asyncio.to_thread(
+                    self._execute_hybrid_search,
+                    question,
+                    question_vector,
+                    index_name,
+                    search_index_name,
+                    pre_filter,
+                    top_k,
+                    hybrid_alpha,
+                )
+                log.debug(
+                    "vectorstore.hybrid_searched",
+                    vector_index=index_name,
+                    search_index=search_index_name,
+                    results=len(results),
+                    top_k=top_k,
+                    alpha=hybrid_alpha,
+                )
+            else:
+                results = await asyncio.to_thread(
+                    self._execute_search,
+                    question_vector,
+                    index_name,
+                    pre_filter,
+                    top_k,
+                )
+                log.debug(
+                    "vectorstore.searched",
+                    index=index_name,
+                    results=len(results),
+                    top_k=top_k,
+                    filter=normalised_filter.describe(),
+                )
             return results
 
         except Exception as e:
@@ -230,7 +385,7 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
                 error=str(e),
             )
             raise VectorSearchError(
-                f"MongoDB Atlas vector search failed on index '{index_name}': {e}"
+                f"MongoDB Atlas search failed on index '{index_name}': {e}"
             ) from e
 
     def close(self) -> None:
