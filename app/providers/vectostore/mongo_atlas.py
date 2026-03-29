@@ -269,7 +269,7 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
                 }
             },
             {"$limit": top_k},
-            {"$set": {"score": {"$meta": "rankFusionScore"}}},
+            {"$addFields": {"score": {"$meta": "score"}}},
             {"$project": {EMBEDDING_KEY: 0}},
         ]
 
