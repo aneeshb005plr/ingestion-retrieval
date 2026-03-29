@@ -209,23 +209,16 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
           $vectorSearch  — semantic similarity (embedding-based)
           $search        — BM25 full-text keyword matching
 
-        Scoring:
-          final_score = (alpha × vector_score) + ((1-alpha) × bm25_score)
-          alpha=0.7 → 70% semantic, 30% keyword (recommended default)
-
-        Why $rankFusion over manual score combination:
-          Atlas $rankFusion handles score normalization automatically.
-          Each pipeline returns ranked results independently.
-          $rankFusion combines rankings using Reciprocal Rank Fusion (RRF)
-          which is more robust than raw score arithmetic.
-
-        Atlas requirement:
-          Vector index: vidx_repo_{repo_id}  (already exists)
-          Search index: sidx_repo_{repo_id}  (must be created in Atlas UI)
+        IMPORTANT — $rankFusion sub-pipeline rules (per Atlas docs):
+          Sub-pipelines are "selection pipelines" — they CANNOT contain
+          stages that modify documents ($set, $project, $addFields etc).
+          Only retrieval/ordering stages allowed: $vectorSearch, $search,
+          $match, $sort, $limit, $sample, $geoNear.
+          All document modifications must happen AFTER $rankFusion.
         """
         num_candidates = max(top_k * 20, 150)
 
-        # Vector search pipeline
+        # Vector search sub-pipeline — NO $set or $project inside
         vector_pipeline: list[dict] = [
             {
                 "$vectorSearch": {
@@ -237,13 +230,9 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
                     **({"filter": pre_filter} if pre_filter else {}),
                 }
             },
-            {"$set": {"score": {"$meta": "vectorSearchScore"}}},
-            {"$project": {EMBEDDING_KEY: 0}},
         ]
 
-        # BM25 full-text search pipeline
-        # Searches the "text" field which contains the chunk content
-        # including R6a document identity prefix
+        # BM25 full-text search sub-pipeline — NO $set or $project inside
         bm25_pipeline: list[dict] = [
             {
                 "$search": {
@@ -255,12 +244,13 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
                 }
             },
             {"$limit": top_k},
-            {"$set": {"score": {"$meta": "searchScore"}}},
-            {"$project": {EMBEDDING_KEY: 0}},
         ]
 
-        # $rankFusion combines both pipelines
-        # weights control contribution of each pipeline
+        # Full pipeline:
+        # 1. $rankFusion combines sub-pipelines (no modifications inside)
+        # 2. $limit after rankFusion
+        # 3. $set score from rankFusionScore metadata (AFTER $rankFusion)
+        # 4. $project to remove embedding (AFTER $rankFusion)
         return [
             {
                 "$rankFusion": {
