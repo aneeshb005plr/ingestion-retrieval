@@ -9,17 +9,20 @@ Problem it solves:
 
 How it works:
   1. Gets distinct known values for each filterable field from vector_store
-  2. Sends question + known values to LLM
-  3. LLM identifies which value the question is about
-  4. Returns filters to merge with user-provided filters
+  2. Computes abbreviations dynamically from known values
+     e.g. "Smart Pricing Tool" → "SPT", "Flex Forecast" → "FF"
+  3. Sends question + known values + abbreviations to LLM
+  4. LLM identifies which value the question is about
+  5. Returns filters to merge with user-provided filters
 
-Why known values matter:
-  Without them, LLM might hallucinate "Smart_Pricing_Tool" instead of
-  "Smart Pricing Tool" — the exact value stored during ingestion.
-  Providing the actual list forces LLM to pick a real value.
+Why dynamic abbreviations matter:
+  Without them, LLM only maps abbreviations it knows from examples.
+  Generic tenants with unknown app names (e.g. "NGC", "RAD") would fail.
+  Dynamic abbreviation generation works for ANY tenant, ANY application.
 """
 
 import json
+import re
 import structlog
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -29,25 +32,81 @@ from app.core.config import settings
 
 log = structlog.get_logger(__name__)
 
-EXTRACTION_PROMPT = """You are a filter extraction assistant.
-Given a user question and a list of known values for each filter field,
-identify which filter values the question is specifically about.
+EXTRACTION_PROMPT = """\
+You are a filter extraction assistant.
+Given a user question and a list of known values for each filter field \
+(with their abbreviations), identify which filter value the question is about.
 
 Rules:
-- Only return a filter if the question clearly refers to a specific value
-- If the question is general (not about a specific application/domain), return null
+- Return a filter if the question mentions or refers to a specific value \
+OR its abbreviation
+- This includes questions like "what is X", "tell me about X", "how does X work" \
+— these ARE asking about X specifically, even if phrased as definitions
+- If the question is truly general (no specific application/domain mentioned), return null
 - Return ONLY valid JSON, no explanation
-- Use exact values from the provided lists — do not invent values
+- Use exact values from the provided lists — never invent values
 
 Example:
   question: "Who is the owner of Smart Pricing Tool?"
-  known application values: ["Smart Pricing Tool", "Flex Forecast", "LeaveApp"]
-  response: {"application": "Smart Pricing Tool"}
+  application values: "Smart Pricing Tool" (SPT), "Flex Forecast" (FF)
+  response: {{"application": "Smart Pricing Tool"}}
+
+Example:
+  question: "what is SPT?"
+  application values: "Smart Pricing Tool" (SPT), "Flex Forecast" (FF)
+  response: {{"application": "Smart Pricing Tool"}}
+
+Example:
+  question: "tell me about FF"
+  application values: "Smart Pricing Tool" (SPT), "Flex Forecast" (FF)
+  response: {{"application": "Flex Forecast"}}
 
 Example:
   question: "What are all the applications we support?"
   response: null
 """
+
+
+def _compute_abbreviation(value: str) -> str:
+    """
+    Compute abbreviation from a multi-word value.
+    Takes the first letter of each significant word (uppercase).
+
+    Examples:
+      "Smart Pricing Tool"  → "SPT"
+      "Flex Forecast"       → "FF"
+      "Leave App"           → "LA"
+      "HR Module"           → "HRM" (includes short words)
+      "SingleWord"          → "" (no abbreviation for single words)
+    """
+    words = re.sub(r"[^a-zA-Z0-9\s]", " ", value).split()
+    if len(words) <= 1:
+        return ""  # single word — no meaningful abbreviation
+    return "".join(w[0].upper() for w in words if w)
+
+
+def _build_values_context(known_values: dict[str, list[str]]) -> str:
+    """
+    Build the values context string for the LLM prompt.
+    Includes dynamically computed abbreviations alongside full names.
+
+    Example output:
+      application values: "Smart Pricing Tool" (SPT), "Flex Forecast" (FF)
+      domain values: "XLOS", "Finance"
+    """
+    lines = []
+    for field, vals in known_values.items():
+        if not vals:
+            continue
+        parts = []
+        for v in vals:
+            abbr = _compute_abbreviation(v)
+            if abbr and abbr.lower() != v.lower():
+                parts.append(f'"{v}" ({abbr})')
+            else:
+                parts.append(f'"{v}"')
+        lines.append(f"{field} values: {', '.join(parts)}")
+    return "\n".join(lines)
 
 
 class FilterExtractor:
@@ -66,10 +125,7 @@ class FilterExtractor:
         Args:
             question:           User's question
             extractable_fields: Fields LLM is allowed to extract
-                                (content dimensions only, never access fields)
-                                e.g. ["application", "domain"]
             known_values:       Distinct values per extractable field
-                                e.g. {"application": ["Smart Pricing Tool", "Flex Forecast"]}
             api_cfg:            Tenant LLM config
             skip_fields:        Fields already in access_filters — skip these
 
@@ -81,7 +137,7 @@ class FilterExtractor:
         known_values = {
             k: v for k, v in known_values.items() if k in extractable_fields
         }
-        # Also skip fields already provided by caller in access_filters
+        # Skip fields already provided by caller in access_filters
         if skip_fields:
             known_values = {
                 k: v for k, v in known_values.items() if k not in skip_fields
@@ -90,14 +146,8 @@ class FilterExtractor:
         if not known_values:
             return {}
 
-        # Build context for LLM
-        values_context = "\n".join(
-            [
-                f"{field} values: {json.dumps(vals)}"
-                for field, vals in known_values.items()
-                if vals
-            ]
-        )
+        # Build context with dynamic abbreviations
+        values_context = _build_values_context(known_values)
 
         if not values_context:
             return {}
@@ -148,6 +198,5 @@ class FilterExtractor:
             return validated
 
         except Exception as e:
-            # Extraction failure is non-fatal — fall back to no filter
             log.warning("filter_extractor.failed", error=str(e))
             return {}
