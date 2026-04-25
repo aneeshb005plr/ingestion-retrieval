@@ -119,31 +119,44 @@ class RetrievalService:
 
         # ── Step 2b: Auto-extract + merge filters ────────────────────────────
         # Always run extraction to add dimensions missing from question.
-        # access_filters (caller) = access control → never overridden
-        # metadata (LLM) = adds specificity to question
-        # Only skips extraction if question has no extractable specifics.
+        # ── Step 2b: Auto-extract + resolve should_filters ───────────────────
+        # Only runs if auto_extract=True AND should_filters is non-empty.
+        # Extracts specific value from question within should_filters scope.
+        # Skips fields already in must_filters (hard boundary).
         #
         # Example:
-        #   caller provides: { domain: "XLOS" }  ← access restriction
-        #   question: "Who owns Smart Pricing Tool?"
-        #   extracted: { application: "Smart Pricing Tool" }
-        #   merged: { domain: "XLOS", application: "Smart Pricing Tool" } ✅
+        #   must_filters:   { access_key: ["SPT::general", "FF::general"] }
+        #   should_filters: { application: ["SPT", "FF", "LeaveApp"] }
+        #   question:       "Who owns SPT?"
+        #   extracted:      { application: "Smart Pricing Tool" }
+        #   validated:      "Smart Pricing Tool" in should_filters ✅
+        #   final:          must applied + application narrowed to SPT only
         #
-        # Example (conflict — caller wins):
-        #   caller provides: { domain: "XLOS" }
-        #   extracted: { domain: "Finance" }  ← LLM guessed wrong
-        #   merged: { domain: "XLOS" } ← caller wins ✅
-        extracted = await self._auto_extract_filters(
-            question=question,
-            repos=repos,
-            tenant_id=tenant_id,
-            api_cfg=api_cfg,
-            filters=filters,
-        )
-        if extracted:
+        # Example (vague question):
+        #   should_filters: { application: [30 apps] }
+        #   question:       "What documents do we have?"
+        #   extracted:      {} → full scope applied ✅
+
+        extracted: dict[str, str] = {}
+
+        if filters.auto_extract and filters.should_filters:
+            extracted = await self._auto_extract_filters(
+                question=question,
+                repos=repos,
+                tenant_id=tenant_id,
+                api_cfg=api_cfg,
+                filters=filters,
+            )
+            if extracted:
+                bound_log.debug(
+                    "retrieval.filters_extracted",
+                    extracted=extracted,
+                )
+        else:
             bound_log.debug(
-                "retrieval.filters_extracted",
-                extracted=extracted,
+                "retrieval.auto_extract_skipped",
+                auto_extract=filters.auto_extract,
+                has_should_filters=bool(filters.should_filters),
             )
 
         # ── Step 3: Embed question ────────────────────────────────────────────
@@ -199,7 +212,7 @@ class RetrievalService:
             try:
                 # Read hybrid search config
                 # hybrid_search_enabled + hybrid_alpha → retrieval_config (generic)
-                # search_index_name → vector_config (provider-specific, Atlas)
+                # search_index_name + collection_name  → vector_config (provider-specific, Atlas)
                 retrieval_cfg = repo.get("retrieval_config", {})
                 vector_cfg = repo.get("vector_config", {})
 
@@ -208,6 +221,9 @@ class RetrievalService:
                 search_index = (
                     vector_cfg.get("search_index_name") or f"sidx_repo_{repo_id}"
                 )
+                # Three-tier collection routing — resolved at repo creation,
+                # stored in vector_config.collection_name
+                collection_name = vector_cfg.get("collection_name") or "vector_store"
 
                 results = await self._vector_store.search(
                     question_vector=question_vector,
@@ -219,6 +235,8 @@ class RetrievalService:
                     hybrid_search_enabled=hybrid_enabled,
                     hybrid_alpha=hybrid_alpha,
                     search_index_name=search_index,
+                    # Collection routing — three-tier isolation
+                    collection_name=collection_name,
                 )
                 # Convert SearchResult objects to dicts
                 chunks = [r.to_dict() for r in results]
@@ -280,15 +298,21 @@ class RetrievalService:
         filters: SearchFilters,
     ) -> dict[str, str]:
         """
-        Use LLM to extract content-dimension hints from the question.
-        Returns dict[str, str] — single values for fields not in caller filters.
+        Use LLM to extract content-dimension hints from question.
+        Narrows should_filters scope to specific value if detected.
+
+        Returns dict[str, str] — single values for should_filters fields.
         Returns empty dict if nothing extracted or extraction fails.
+
+        Skips fields already in must_filters — those are hard boundaries.
+        Only tries to narrow should_filters fields.
         """
-        # Collect extractable_fields + known values per repo
-        # Each repo scoped individually — prevents cross-repo field confusion
-        # e.g. repo A has extractable=[application], repo B has [table_name]
-        # Without scoping: LLM sees both fields mixed — wrong
-        # With scoping: each repo contributes only its own fields + values
+        # Skip fields already locked in must_filters
+        skip_fields = list(filters.must_filters.keys())
+
+        # Build known_values from should_filters scope
+        # Only extract for fields that are in should_filters
+        # Each repo contributes its own extractable fields
         known_values: dict[str, list[str]] = {}
 
         for repo in repos:
@@ -300,37 +324,76 @@ class RetrievalService:
 
             repo_id = repo["_id"]
             for field in repo_extractable:
-                values = await self._repo_repo.get_distinct_filter_values(
-                    tenant_id=tenant_id,
-                    field_name=field,
-                    repo_ids=[repo_id],  # ← scoped to this repo only
-                )
-                if values:
-                    # Union across repos — same field may exist in multiple repos
+                # Only extract for fields in should_filters scope
+                if field not in filters.should_filters:
+                    continue
+                # Skip fields already in must_filters
+                if field in skip_fields:
+                    continue
+
+                # Use should_filters values as known_values
+                # These are the ACTUAL allowed values for this user
+                # Much more accurate than querying vector_store
+                # (which might have values user can't access)
+                scope_values = filters.should_filters.get(field, [])
+                if scope_values:
                     existing = known_values.get(field, [])
-                    merged = list(
-                        dict.fromkeys(existing + values)
-                    )  # dedup, preserve order
+                    merged = list(dict.fromkeys(existing + scope_values))
                     known_values[field] = merged
+
+        if not known_values:
+            # Fall back to querying vector_store for known values
+            # Used when should_filters is empty but extractable_fields exist
+            for repo in repos:
+                repo_extractable = repo.get("retrieval_config", {}).get(
+                    "extractable_fields", []
+                )
+                if not repo_extractable:
+                    continue
+                repo_id = repo["_id"]
+                for field in repo_extractable:
+                    if field in skip_fields:
+                        continue
+                    values = await self._repo_repo.get_distinct_filter_values(
+                        tenant_id=tenant_id,
+                        field_name=field,
+                        repo_ids=[repo_id],
+                        repos=[repo],
+                    )
+                    if values:
+                        existing = known_values.get(field, [])
+                        merged = list(dict.fromkeys(existing + values))
+                        known_values[field] = merged
 
         if not known_values:
             return {}
 
-        # all_extractable = union of field names across repos (for extractor param)
         all_extractable = set(known_values.keys())
 
-        # Extract filters using LLM
-        # Skip fields already provided by caller in access_filters
         extracted = await self._filter_extractor.extract(
             question=question,
             extractable_fields=list(all_extractable),
             known_values=known_values,
             api_cfg=api_cfg,
-            skip_fields=list(filters.filters.keys()),
+            skip_fields=skip_fields,
         )
 
         if not extracted:
             return {}
 
-        # Only return fields not already in caller's filters
-        return {k: v for k, v in extracted.items() if k not in filters.filters}
+        # Validate extracted values are within should_filters scope
+        validated = {}
+        for field, value in extracted.items():
+            scope = filters.should_filters.get(field, [])
+            if scope and value not in scope:
+                # Out of scope — skip this extraction
+                log.debug(
+                    "retrieval.extraction_out_of_scope",
+                    field=field,
+                    extracted=value,
+                    scope_size=len(scope),
+                )
+                continue
+            validated[field] = value
+
+        return validated

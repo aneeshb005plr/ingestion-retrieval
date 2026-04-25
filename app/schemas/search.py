@@ -1,45 +1,35 @@
 """
-Search request filters schema.
+Search filter schema — must_filters, should_filters, auto_extract.
 
-SearchFilters is intentionally flat and simple from the caller's perspective.
-The caller passes access control dimensions as field → list of allowed values.
-LLM extraction is completely internal — never exposed in the API.
+Three-layer filter model:
 
-API request example:
-  {
-    "question": "Who is the owner of Smart Pricing Tool?",
-    "filters": {
-      "application": ["Smart Pricing Tool", "LeaveApp"],
-      "access_group": ["xlos_all", "all"]
-    }
-  }
+  must_filters (hard boundary):
+    Always applied — no exceptions.
+    Consumer resolves user permissions and sends here.
+    Platform never overrides.
+    e.g. access_key: ["SPT::general", "FF::general", "FF::restricted"]
 
-Multiple fields supported — caller adds any filterable field:
-  Single field:
-    { "application": ["SPT"] }
+  should_filters (soft scope):
+    User's allowed scope — platform narrows using LLM if auto_extract=True.
+    Falls back to full list if question is vague or auto_extract=False.
+    e.g. application: ["SPT", "FF", "LeaveApp", ...30 apps]
 
-  Multiple fields (ANDed):
-    { "application": ["SPT", "LeaveApp"], "domain": ["XLOS", "HR"] }
+  auto_extract (boolean):
+    Should platform try to narrow should_filters from question?
+    true  → LLM extracts specific value from question, narrows should_filters
+    false → should_filters applied as-is (full scope)
 
-  App + document restriction:
-    { "application": ["SPT"], "access_group": ["xlos_all", "all"] }
+Why this design:
+  Platform is generic — does not know what access_group, access_key,
+  schema_name or any other field means.
+  Consumer owns their access model and resolves it before calling.
+  Platform applies whatever consumer sends, blindly and correctly.
 
-  Source-level access:
-    { "source_id": ["01ABC...", "01DEF..."] }
-
-  No filters (search all):
-    {}
-
-Semantics:
-  Multiple fields  → ANDed  (must satisfy ALL dimensions)
-  Multiple values  → ORed   (must match ANY value in the list)
-  include_general  → adds general/shared docs to each dimension
-
-Internal processing (never in API):
-  FilterExtractor may add single-value hints from the question
-  for fields NOT already provided by the caller.
-  These are merged before building the NormalisedFilter.
-  Caller-provided values always take precedence.
+  Works for ANY consumer:
+    DocAssist:   must={access_key:[...]}, should={application:[30 apps]}
+    SmartQuery:  must={schema_name:[...]}, should={table_name:[20 tables]}
+    Simple tool: must={}, should={}  → no restrictions
+    Admin:       must={}, should={}  → sees everything in tenant scope
 """
 
 from pydantic import BaseModel, Field
@@ -47,42 +37,67 @@ from pydantic import BaseModel, Field
 
 class SearchFilters(BaseModel):
     """
-    Flat access control filters from the API caller.
+    New filter model — must_filters + should_filters + auto_extract.
 
-    filters: dict[str, list[str]]
-        Each key is a filterable field name (must be in repo's filterable_fields).
-        Each value is a list of allowed values for that field.
-        Multiple fields are ANDed. Values within a field are ORed.
+    Replaces old SearchFilters with flat filters dict.
+    Backward compatible — old 'filters' field mapped to must_filters.
 
-        Examples:
-          { "application": ["SPT", "LeaveApp"] }
-          → (application=SPT OR application=LeaveApp OR is_general=true)
+    must_filters:
+      Hard access boundaries — always applied.
+      field → list[str] (OR within field, AND across fields)
+      e.g. {
+        "access_key": ["SPT::general", "FF::general", "FF::restricted"],
+        "access_group": ["general"]
+      }
 
-          { "application": ["SPT"], "access_group": ["xlos_all", "all"] }
-          → (application=SPT OR is_general=true)
-            AND (access_group=xlos_all OR access_group=all OR is_general=true)
+    should_filters:
+      Soft scope — LLM narrows if auto_extract=True and question is specific.
+      Falls back to full list if nothing detected.
+      e.g. {
+        "application": ["SPT", "FF", "LeaveApp", ... 30 apps]
+      }
 
-    include_general:
-        If True and repo has general_flag_field, general/shared docs
-        are included in each dimension's OR clause.
-        Default True — general docs are always visible.
+    auto_extract:
+      True  → LLM tries to narrow should_filters from question
+      False → should_filters applied as-is
     """
 
-    filters: dict[str, list[str]] = Field(
+    must_filters: dict[str, list[str]] = Field(
         default_factory=dict,
         description=(
-            "Access control filters — field → list of allowed values. "
-            "Multiple fields are ANDed. Values within a field are ORed. "
-            "Examples: "
-            "{application: ['SPT', 'LeaveApp']} or "
-            "{application: ['SPT'], access_group: ['xlos_all', 'all']} or "
-            "{source_id: ['01ABC...', '01DEF...']}"
+            "Hard access boundaries — always applied, never overridden. "
+            "Consumer resolves user permissions and sends here. "
+            "field → list of allowed values (OR within, AND across). "
+            "e.g. {access_key: ['SPT::general', 'FF::restricted']}"
         ),
     )
+    should_filters: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Soft scope — user's allowed values for content dimensions. "
+            "Platform narrows using LLM if auto_extract=True and question is specific. "
+            "Falls back to full list if question is vague. "
+            "e.g. {application: ['SPT', 'FF', 'LeaveApp', ...30 apps]}"
+        ),
+    )
+    auto_extract: bool = Field(
+        default=True,
+        description=(
+            "If True, platform uses LLM to narrow should_filters from question. "
+            "If False, should_filters applied as-is (full scope). "
+            "Set False when consumer already sent specific value in must_filters."
+        ),
+    )
+
+    # ── Backward compatibility ────────────────────────────────────────────────
+    # Old API sent: filters: { filters: {...}, include_general: true }
+    # New API uses must_filters + should_filters
+    # Keep include_general for repos that still use general_flag_field
     include_general: bool = Field(
         default=True,
         description=(
-            "If True and repo has a general_flag_field, "
-            "general/shared docs are included alongside filtered ones."
+            "If True and repo has general_flag_field, "
+            "general/shared docs included in each dimension. "
+            "Kept for backward compatibility."
         ),
     )

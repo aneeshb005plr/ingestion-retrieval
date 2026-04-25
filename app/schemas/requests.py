@@ -3,6 +3,11 @@ REST API request schemas for the Retrieval Service.
 
 SearchRequest  — POST /api/v1/{tenant_id}/search
 QueryRequest   — POST /api/v1/{tenant_id}/query
+
+Filter model:
+  must_filters   → hard access boundaries (always applied)
+  should_filters → soft scope (LLM narrows if auto_extract=True)
+  auto_extract   → whether platform narrows should_filters from question
 """
 
 from pydantic import BaseModel, Field
@@ -13,6 +18,41 @@ class SearchRequest(BaseModel):
     """
     Request body for POST /api/v1/{tenant_id}/search.
     Returns ranked chunks only — no LLM call.
+
+    Example — DocAssist user with mixed access:
+    {
+      "question": "Who is the owner of SPT?",
+      "filters": {
+        "must_filters": {
+          "access_key": ["Smart Pricing Tool::general",
+                         "Flex Forecast::general",
+                         "Flex Forecast::restricted"]
+        },
+        "should_filters": {
+          "application": ["Smart Pricing Tool", "Flex Forecast", "Leave App"]
+        },
+        "auto_extract": true
+      }
+    }
+
+    Example — no access control (internal):
+    {
+      "question": "Who owns SPT?",
+      "filters": { "must_filters": {}, "should_filters": {}, "auto_extract": true }
+    }
+
+    Example — user explicit filter from UI dropdown:
+    {
+      "question": "Who owns SPT?",
+      "filters": {
+        "must_filters": {
+          "access_key": ["Smart Pricing Tool::general"],
+          "application": ["Smart Pricing Tool"]   ← explicit selection
+        },
+        "should_filters": {},
+        "auto_extract": false   ← no need, already explicit
+      }
+    }
     """
 
     question: str = Field(
@@ -24,10 +64,13 @@ class SearchRequest(BaseModel):
     )
     filters: SearchFilters = Field(
         default_factory=SearchFilters,
-        description="Optional metadata filters scoped to the tenant's field names.",
+        description=(
+            "Filter model with must_filters (hard), "
+            "should_filters (soft scope), and auto_extract flag."
+        ),
     )
     top_k: int = Field(
-        default=5,
+        default=10,
         ge=1,
         le=20,
         description="Number of chunks to return across all repos.",
@@ -53,10 +96,13 @@ class QueryRequest(BaseModel):
     )
     filters: SearchFilters = Field(
         default_factory=SearchFilters,
-        description="Optional metadata filters scoped to the tenant's field names.",
+        description=(
+            "Filter model with must_filters (hard), "
+            "should_filters (soft scope), and auto_extract flag."
+        ),
     )
     top_k: int = Field(
-        default=5,
+        default=10,
         ge=1,
         le=20,
         description="Number of chunks to retrieve for context.",

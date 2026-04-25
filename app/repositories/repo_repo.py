@@ -106,30 +106,58 @@ class RepoRepository(BaseRepository):
         tenant_id: str,
         field_name: str,
         repo_ids: list[str] | None = None,
+        repos: list[dict] | None = None,
     ) -> list[str]:
         """
-        Get distinct values for an extractable field from vector_store.
-        Used to give FilterExtractor (LLM) the real values to choose from —
-        prevents hallucinated filter values.
+        Get distinct values for an extractable field from the correct collections.
 
-        IMPORTANT: This should only be called for extractable_fields —
-        content dimensions like "application" and "domain".
-        The guard lives in retrieval_service._auto_extract_filters which
-        only iterates over repo.retrieval_config.extractable_fields.
-        Access control fields (access_group, source_id) are never passed here.
+        Three-tier collection routing:
+          shared_tenant    → query "vector_store"
+          dedicated_tenant → query "vector_store_{tenant_id}"
+          dedicated_repo   → query "vector_store_{repo_id}"
+
+        We must query ALL relevant collections — a tenant may have repos
+        across different tiers (e.g. some shared, one dedicated).
+
+        IMPORTANT: Only called for extractable_fields — content dimensions
+        like "application" and "domain". Never access control fields.
+
+        Args:
+            tenant_id:  Tenant to scope the query
+            field_name: e.g. "application" or "domain"
+            repo_ids:   Optional scope to specific repos
+            repos:      Repo config docs — used to resolve collection names
+                        If None, falls back to default "vector_store"
 
         e.g. field_name="application" →
              ["Smart Pricing Tool", "Flex Forecast", "LeaveApp"]
-        e.g. field_name="domain" →
-             ["XLOS", "EIT"]
         """
-        vector_collection = self.db["vector_store"]
-        match: dict = {"tenant_id": tenant_id, field_name: {"$exists": True}}
-        if repo_ids:
-            match["repo_id"] = {"$in": repo_ids}
+        # Build a set of (collection_name, optional repo_id_filter) to query
+        # Group repos by collection so we minimise DB round trips
+        collection_repo_map: dict[str, list[str]] = {}  # collection → [repo_ids]
 
-        values = await vector_collection.distinct(field_name, match)
-        # Exclude empty strings and the "general" placeholder value —
-        # "general" is a path convention default, not a meaningful filter value
-        # for LLM extraction (user would never ask "tell me about general docs")
-        return [v for v in values if v and v not in ("general", "unknown")]
+        if repos:
+            for repo in repos:
+                rid = str(repo.get("_id", ""))
+                if repo_ids and rid not in repo_ids:
+                    continue
+                vector_cfg = repo.get("vector_config", {})
+                col = vector_cfg.get("collection_name") or "vector_store"
+                collection_repo_map.setdefault(col, []).append(rid)
+        else:
+            # No repo config available — fall back to shared collection
+            collection_repo_map["vector_store"] = repo_ids or []
+
+        all_values: set[str] = set()
+
+        for col_name, col_repo_ids in collection_repo_map.items():
+            collection = self.db[col_name]
+            match: dict = {"tenant_id": tenant_id, field_name: {"$exists": True}}
+            if col_repo_ids:
+                match["repo_id"] = {"$in": col_repo_ids}
+            values = await collection.distinct(field_name, match)
+            all_values.update(values)
+
+        # Exclude empty strings and placeholder values
+        # "general" is a path convention default — never a meaningful filter
+        return [v for v in all_values if v and v not in ("general", "unknown")]

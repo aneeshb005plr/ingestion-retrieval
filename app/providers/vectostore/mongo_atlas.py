@@ -55,7 +55,7 @@ from app.core.exceptions import VectorSearchError
 
 log = structlog.get_logger(__name__)
 
-VECTOR_COLLECTION = "vector_store"
+DEFAULT_VECTOR_COLLECTION = "vector_store"
 TEXT_KEY = "text"
 EMBEDDING_KEY = "embedding"
 
@@ -68,8 +68,25 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
             serverSelectionTimeoutMS=5000,
             tz_aware=True,
         )
-        self._collection = self._sync_client[settings.MONGO_DB_NAME][VECTOR_COLLECTION]
+        # Default collection — used when collection_name not passed to search()
+        # Each search() call can override this via collection_name kwarg
+        self._default_collection = self._sync_client[settings.MONGO_DB_NAME][
+            DEFAULT_VECTOR_COLLECTION
+        ]
         log.info("vectorstore_provider.initialized", type="mongodb_atlas")
+
+    def _get_collection(self, collection_name: str | None = None):
+        """
+        Return the correct sync collection for this search.
+
+        collection_name is resolved at repo creation time and stored in
+        vector_config.collection_name — retrieval_service reads and passes it.
+
+        Falls back to DEFAULT_VECTOR_COLLECTION if not provided.
+        """
+        if collection_name and collection_name != DEFAULT_VECTOR_COLLECTION:
+            return self._sync_client[settings.MONGO_DB_NAME][collection_name]
+        return self._default_collection
 
     # ── Filter translation ────────────────────────────────────────────────────
 
@@ -165,6 +182,7 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
         index_name: str,
         pre_filter: dict,
         top_k: int,
+        collection=None,
     ) -> list[SearchResult]:
         pipeline = self._build_pipeline(
             question_vector=question_vector,
@@ -173,8 +191,9 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
             top_k=top_k,
         )
 
+        col = collection if collection is not None else self._default_collection
         results = []
-        for doc in self._collection.aggregate(pipeline):
+        for doc in col.aggregate(pipeline):
             text = doc.pop(TEXT_KEY, "")
             score = doc.pop("score", 0.0)
             repo_id = str(doc.pop("repo_id", ""))
@@ -282,6 +301,7 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
         pre_filter: dict,
         top_k: int,
         alpha: float,
+        collection=None,
     ) -> list[SearchResult]:
         pipeline = self._build_hybrid_pipeline(
             question=question,
@@ -292,8 +312,9 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
             top_k=top_k,
             alpha=alpha,
         )
+        col = collection if collection is not None else self._default_collection
         results = []
-        for doc in self._collection.aggregate(pipeline):
+        for doc in col.aggregate(pipeline):
             text = doc.pop(TEXT_KEY, "")
             score = doc.pop("score", 0.0)
             repo_id = str(doc.pop("repo_id", ""))
@@ -320,6 +341,7 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
         hybrid_search_enabled: bool = False,
         hybrid_alpha: float = 0.7,
         search_index_name: str = "",
+        collection_name: str | None = None,
         **kwargs: Any,
     ) -> list[SearchResult]:
         """
@@ -328,8 +350,14 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
         Pure vector:  hybrid_search_enabled=False (default)
         Hybrid:       hybrid_search_enabled=True
                       Requires search_index_name and question.
+
+        collection_name: resolved from vector_config at retrieval time.
+          None / "vector_store" → default shared collection
+          "vector_store_{tenant_id}" → dedicated tenant collection
+          "vector_store_{repo_id}"   → dedicated repo collection
         """
         pre_filter = self._translate_filter(normalised_filter)
+        collection = self._get_collection(collection_name)
 
         try:
             if hybrid_search_enabled and question and search_index_name:
@@ -342,11 +370,13 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
                     pre_filter,
                     top_k,
                     hybrid_alpha,
+                    collection,
                 )
                 log.debug(
                     "vectorstore.hybrid_searched",
                     vector_index=index_name,
                     search_index=search_index_name,
+                    collection=collection_name or DEFAULT_VECTOR_COLLECTION,
                     results=len(results),
                     top_k=top_k,
                     alpha=hybrid_alpha,
@@ -358,10 +388,12 @@ class MongoDBAtlasVectorStoreProvider(BaseVectorStoreProvider):
                     index_name,
                     pre_filter,
                     top_k,
+                    collection,
                 )
                 log.debug(
                     "vectorstore.searched",
                     index=index_name,
+                    collection=collection_name or DEFAULT_VECTOR_COLLECTION,
                     results=len(results),
                     top_k=top_k,
                     filter=normalised_filter.describe(),
