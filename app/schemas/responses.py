@@ -1,10 +1,26 @@
 """
 REST API response schemas for the Retrieval Service.
 
-ChunkResponse   — single chunk returned from search
+ChunkResponse   — single chunk returned from search or query
 SearchResponse  — POST /api/v1/{tenant_id}/search
 QueryResponse   — POST /api/v1/{tenant_id}/query
 RepoResponse    — GET  /api/v1/{tenant_id}/repos
+
+── QueryResponse change log (R7) ────────────────────────────────────────────
+Before R7:
+  answer: str                    ← always present, even on no-answer
+  chunks: list[ChunkResponse]    ← ALL retrieved chunks, even unused ones
+  total_chunks: int              ← count of ALL retrieved chunks
+
+After R7:
+  answer: str | None             ← None when answer_available is False
+  answer_available: bool         ← NEW — False = answer not in documents
+  chunks: list[ChunkResponse]    ← ONLY chunks the LLM cited
+  cited_chunks: int              ← count of cited chunks (replaces total_chunks)
+
+Consumers MUST check answer_available before reading answer.
+When answer_available is False, chunks will always be [].
+─────────────────────────────────────────────────────────────────────────────
 """
 
 from pydantic import BaseModel, Field
@@ -28,7 +44,9 @@ class ChunkResponse(BaseModel):
     file_name: str | None = Field(default=None, description="Source file name.")
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="Additional metadata fields (tenant-specific: domain, application etc.)",
+        description=(
+            "Additional metadata fields (tenant-specific: domain, application etc.)"
+        ),
     )
 
     @classmethod
@@ -74,16 +92,86 @@ class SearchResponse(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    """Response for POST /api/v1/{tenant_id}/query."""
+    """
+    Response for POST /api/v1/{tenant_id}/query.
+
+    answer_available signals whether the retrieved documents contained
+    enough information to answer the question.
+
+    When answer_available is True:
+      - answer  contains the LLM-generated answer text
+      - chunks  contains ONLY the document excerpts the LLM cited
+      - cited_chunks > 0
+
+    When answer_available is False:
+      - answer  is None — the LLM could not answer from the context
+      - chunks  is []  — no chunks are attributed (nothing to cite)
+      - cited_chunks is 0
+
+    Consumers should always check answer_available before reading answer.
+
+    Example (answer found):
+      {
+        "question": "Who owns SPT?",
+        "answer": "The owner of SPT is John Smith.",
+        "answer_available": true,
+        "chunks": [
+          { "text": "...", "score": 0.91, "file_name": "SPT_Owners.pdf", ... }
+        ],
+        "cited_chunks": 1,
+        "skipped_filters": []
+      }
+
+    Example (answer not found):
+      {
+        "question": "What is the GDP of France?",
+        "answer": null,
+        "answer_available": false,
+        "chunks": [],
+        "cited_chunks": 0,
+        "skipped_filters": []
+      }
+    """
 
     question: str
-    answer: str = Field(
-        description="LLM-generated answer grounded in retrieved chunks."
+
+    answer: str | None = Field(
+        default=None,
+        description=(
+            "LLM-generated answer grounded in cited chunks. "
+            "Null when answer_available is False."
+        ),
     )
+
+    answer_available: bool = Field(
+        description=(
+            "True if the retrieved documents contained enough information "
+            "to answer the question. False = the question is out of scope "
+            "for the available documents."
+        ),
+    )
+
     chunks: list[ChunkResponse] = Field(
-        description="Source chunks used to generate the answer."
+        description=(
+            "Document chunks the LLM cited when constructing the answer. "
+            "Empty when answer_available is False. "
+            "Will NOT include chunks that were retrieved but not used."
+        ),
     )
-    total_chunks: int = Field(description="Number of chunks used as context.")
+
+    cited_chunks: int = Field(
+        description=(
+            "Number of document chunks cited by the LLM. "
+            "Always equals len(chunks). Zero when answer_available is False."
+        ),
+    )
+
+    skipped_filters: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Filter fields that were not applied because no repo supports them."
+        ),
+    )
 
 
 class RepoSummary(BaseModel):

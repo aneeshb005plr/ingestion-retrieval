@@ -1,399 +1,296 @@
 """
-RetrievalService — orchestrates the full search pipeline.
+LLM Service — generates answers from retrieved chunks (RAG).
 
-Flow per request:
-  1. Load tenant from MongoDB → resolve api_config (decrypt key)
-  2. Load active repos for tenant (or scoped repo_ids)
-  3. Embed the question using tenant's embedding model + api_config
-  4. For each repo:
-     a. Build pre_filter from repo.retrieval_config + request filters
-     b. Run $vectorSearch on the tenant's Atlas index
-  5. Merge results from all repos → sort by score → return top_k
+Used only by POST /api/v1/{tenant_id}/query.
+POST /api/v1/{tenant_id}/search bypasses this entirely — chunks only.
 
-Design decisions:
-  - Repos searched concurrently (asyncio.gather) for performance
-  - Each repo uses its own pre_filter — no cross-repo filter bleed
-  - Embedding happens once — same vector reused across all repos
-    (all repos for a tenant share the same index and embedding model)
-  - If a repo search fails, it is logged and skipped (graceful degradation)
-    so one bad repo doesn't block results from healthy repos
+Uses tenant's resolved api_config:
+  - genai_api_key  → api_cfg.api_key    (decrypted Fernet key)
+  - genai_base_url → api_cfg.base_url   (Azure OpenAI endpoint)
+  - llm_model      → api_cfg.llm_model  (e.g. gpt-4.1-mini)
+
+── Structured Output Contract ───────────────────────────────────────────────
+The LLM is asked to return a JSON object — NOT free text.
+This lets us know EXACTLY which chunks were used and whether an answer
+was found at all.
+
+Expected JSON from LLM:
+  {
+    "answer": "The owner of SPT is John Smith.",
+    "answer_found": true,
+    "used_chunk_indices": [0, 2]
+  }
+
+  answer             — the answer text (null if answer_found is false)
+  answer_found       — false when context doesn't contain enough to answer
+  used_chunk_indices — 0-based indices of chunks the LLM drew from
+
+Fallback on parse failure:
+  If the LLM returns malformed JSON, we return the raw text as the answer
+  with answer_found=True and used_chunk_indices=[] (no citation rather
+  than wrong citation). This is the safe production choice — the user
+  still gets an answer, but no chunks are attributed.
+
+  Logged as: llm_service.json_parse_failed (warning)
+─────────────────────────────────────────────────────────────────────────────
 """
 
-import asyncio
+import json
 import structlog
-from typing import Optional
+from dataclasses import dataclass, field
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
-from app.core.api_config import resolve_api_config, ResolvedApiConfig
+from app.core.api_config import ResolvedApiConfig
 from app.core.config import settings
-from app.core.exceptions import (
-    TenantNotFoundError,
-    TenantInactiveError,
-    NoActiveReposError,
-)
-from app.providers.embedding.base import BaseEmbeddingProvider
-from app.providers.embedding.factory import EmbeddingProviderFactory
-from app.providers.vectorstore.base import BaseVectorStoreProvider
-from app.repositories.tenant_repo import TenantRepository
-from app.repositories.repo_repo import RepoRepository
-from app.services.filter_builder import FilterBuilder
-from app.services.filter_extractor import FilterExtractor
-from app.services.reranker import Reranker
-from app.schemas.search import SearchFilters
+from app.core.exceptions import LLMError
 
 log = structlog.get_logger(__name__)
 
+# ── Structured output prompt ──────────────────────────────────────────────────
+# Numbered chunks are passed so the LLM can cite by index.
+# Strict JSON-only instruction — no preamble, no markdown fences.
+# "used_chunk_indices" forces explicit attribution rather than implicit use.
+# "answer_found: false" path prevents hallucination on out-of-scope questions.
 
-class RetrievalService:
+SYSTEM_PROMPT = """\
+You are a precise document assistant. Answer the question using ONLY the \
+numbered document excerpts provided.
 
-    def __init__(
-        self,
-        tenant_repo: TenantRepository,
-        repo_repo: RepoRepository,
-        vector_store: BaseVectorStoreProvider,
-        filter_builder: FilterBuilder,
-        embedding_factory: EmbeddingProviderFactory,
-        filter_extractor: FilterExtractor,
-    ) -> None:
-        self._tenant_repo = tenant_repo
-        self._repo_repo = repo_repo
-        self._vector_store = vector_store
-        self._filter_builder = filter_builder
-        self._embedding_factory = embedding_factory
-        self._filter_extractor = filter_extractor
-        self._reranker = Reranker()
+Rules:
+1. Read all excerpts carefully before answering.
+2. Base your answer ONLY on information present in the excerpts.
+3. If the excerpts do not contain enough information to answer, set \
+answer_found to false.
+4. Do NOT make up information or use outside knowledge.
+5. In used_chunk_indices list ONLY the excerpt numbers (0-based) that you \
+actually read and used to construct your answer. Omit excerpts that were \
+irrelevant.
 
-    async def search(
+Respond with a single JSON object and nothing else — no markdown fences, \
+no preamble, no explanation outside the JSON:
+
+{
+  "answer": "<your answer, or null if answer_found is false>",
+  "answer_found": <true or false>,
+  "used_chunk_indices": [<0-based indices of excerpts used, empty if none>]
+}"""
+
+
+@dataclass
+class LLMResult:
+    """
+    Typed result from LLMService.generate_answer().
+
+    answer             — LLM answer text. None when answer_found is False.
+    answer_found       — True if the context contained enough to answer.
+    used_indices       — 0-based indices into the chunks list that the LLM
+                         used. Caller filters the chunk list by these indices
+                         to build cited_chunks for the API response.
+    parse_failed       — True if JSON parsing failed; caller should treat
+                         answer as unattributed plain text (no chunks).
+    """
+
+    answer: str | None
+    answer_found: bool
+    used_indices: list[int] = field(default_factory=list)
+    parse_failed: bool = False
+
+
+class LLMService:
+
+    async def generate_answer(
         self,
         question: str,
-        tenant_id: str,
-        filters: SearchFilters,
-        top_k: int = 5,
-        repo_ids: list[str] | None = None,
-    ) -> tuple[list[dict], list[str]]:
+        chunks: list[dict],
+        api_cfg: ResolvedApiConfig,
+    ) -> LLMResult:
         """
-        Search for relevant document chunks matching the question.
+        Generate a structured answer grounded in the retrieved chunks.
+
+        Chunks are passed to the LLM numbered (Chunk 0, Chunk 1, …).
+        The LLM returns a JSON object specifying:
+          - the answer text
+          - whether an answer was found at all
+          - which chunk indices it actually used
 
         Args:
-            question:   User's question in natural language
-            tenant_id:  Tenant making the request
-            filters:    Optional metadata filters (application, domain etc.)
-            top_k:      Number of results to return (across all repos)
-            repo_ids:   Optional list of repo IDs to scope the search
+            question:  The user's question.
+            chunks:    Retrieved + reranked chunks from RetrievalService.search().
+                       These are the candidates — the LLM may use only a subset.
+            api_cfg:   Resolved tenant api_config (decrypted key, model etc.)
 
         Returns:
-            Tuple of (chunks, skipped_filters).
-            chunks: list of chunk dicts sorted by relevance score.
-            skipped_filters: filter fields that were not supported by any repo.
+            LLMResult — structured result with answer, answer_found, used_indices.
 
         Raises:
-            TenantNotFoundError  — tenant does not exist
-            TenantInactiveError  — tenant is inactive
-            NoActiveReposError   — tenant has no active repos
-            EmbeddingError       — question embedding failed
+            LLMError — if the LLM call itself fails (network, auth, quota).
         """
-        bound_log = log.bind(tenant_id=tenant_id, top_k=top_k)
-        bound_log.info("retrieval.search_start", question_len=len(question))
+        if not chunks:
+            log.info("llm_service.no_chunks", model=api_cfg.llm_model)
+            return LLMResult(
+                answer=None,
+                answer_found=False,
+                used_indices=[],
+            )
 
-        # ── Step 1: Load tenant + resolve api_config ─────────────────────────
-        tenant = await self._tenant_repo.get_by_id(tenant_id)
-        api_cfg = await resolve_api_config(
-            tenant_api_config=tenant.get("api_config"),
-            tenant_ingestion_defaults=tenant.get("ingestion_defaults", {}),
+        # ── Build numbered context block ──────────────────────────────────────
+        # Each chunk gets a 0-based index so the LLM can cite by number.
+        # file_name is included as the source label for readability.
+        context_parts = []
+        for idx, chunk in enumerate(chunks):
+            source = chunk.get("file_name") or chunk.get("source_url") or "Unknown"
+            text = chunk.get("text", "").strip()
+            context_parts.append(f"[Chunk {idx}] Source: {source}\n{text}")
+
+        context = "\n\n---\n\n".join(context_parts)
+
+        # ── Build LLM client ──────────────────────────────────────────────────
+        llm_kwargs: dict = dict(
+            model=api_cfg.llm_model,
+            api_key=api_cfg.api_key,
+            temperature=0,
+            max_tokens=1000,
         )
-        bound_log.debug(
-            "retrieval.api_config_resolved",
-            model=api_cfg.embedding_model,
-            tenant_key=api_cfg.is_tenant_key,
-        )
+        if api_cfg.base_url:
+            llm_kwargs["base_url"] = api_cfg.base_url
+        if settings.OPENAI_API_VERSION:
+            llm_kwargs["openai_api_version"] = settings.OPENAI_API_VERSION
 
-        # ── Step 2: Load active repos ─────────────────────────────────────────
-        if repo_ids:
-            repos = await self._repo_repo.get_active_by_ids(
-                tenant_id=tenant_id,
-                repo_ids=repo_ids,
-            )
-        else:
-            repos = await self._repo_repo.get_active_for_tenant(tenant_id)
-
-        bound_log.debug("retrieval.repos_loaded", count=len(repos))
-
-        # ── Step 2b: Auto-extract + merge filters ────────────────────────────
-        # Always run extraction to add dimensions missing from question.
-        # ── Step 2b: Auto-extract + resolve should_filters ───────────────────
-        # Only runs if auto_extract=True AND should_filters is non-empty.
-        # Extracts specific value from question within should_filters scope.
-        # Skips fields already in must_filters (hard boundary).
-        #
-        # Example:
-        #   must_filters:   { access_key: ["SPT::general", "FF::general"] }
-        #   should_filters: { application: ["SPT", "FF", "LeaveApp"] }
-        #   question:       "Who owns SPT?"
-        #   extracted:      { application: "Smart Pricing Tool" }
-        #   validated:      "Smart Pricing Tool" in should_filters ✅
-        #   final:          must applied + application narrowed to SPT only
-        #
-        # Example (vague question):
-        #   should_filters: { application: [30 apps] }
-        #   question:       "What documents do we have?"
-        #   extracted:      {} → full scope applied ✅
-
-        extracted: dict[str, str] = {}
-
-        if filters.auto_extract and filters.should_filters:
-            extracted = await self._auto_extract_filters(
-                question=question,
-                repos=repos,
-                tenant_id=tenant_id,
-                api_cfg=api_cfg,
-                filters=filters,
-            )
-            if extracted:
-                bound_log.debug(
-                    "retrieval.filters_extracted",
-                    extracted=extracted,
-                )
-        else:
-            bound_log.debug(
-                "retrieval.auto_extract_skipped",
-                auto_extract=filters.auto_extract,
-                has_should_filters=bool(filters.should_filters),
-            )
-
-        # ── Step 3: Embed question ────────────────────────────────────────────
-        embedder = self._embedding_factory.build(
-            api_cfg=api_cfg,
-            api_version=settings.OPENAI_API_VERSION,
-        )
-        question_vector = await embedder.embed_query(question)
-        bound_log.debug(
-            "retrieval.question_embedded",
-            dims=len(question_vector),
-        )
-
-        # ── Step 4: Search each repo concurrently ─────────────────────────────
-        # Fetch vector_top_k per repo — wider than top_k to give reranker
-        # enough candidates. Reranker then selects the best top_k.
-        #
-        # vector_top_k = top_k * 3, capped at 30:
-        #   Gives reranker 3x more candidates than needed
-        #   Cap at 30 to control reranker LLM token cost
-        #   30 chunks × ~500 tokens = ~15k tokens per rerank call
-        vector_top_k = min(max(top_k * 3, 20), 30)
-
-        async def search_repo(repo: dict) -> tuple[list[dict], list[str]]:
-            repo_id = repo["_id"]
-            index_name = repo.get("vector_config", {}).get(
-                "index_name", f"vidx_repo_{repo['_id']}"
-            )
-            normalised_filter = self._filter_builder.build(
-                tenant_id=tenant_id,
-                repo=repo,
-                filters=filters,
-                extracted_metadata=extracted,
-            )
-            # Track which filter fields were skipped (not in filterable_fields)
-            # Includes both caller filters and LLM extracted fields
-            all_requested = set(filters.filters.keys())
-            if extracted:
-                all_requested.update(extracted.keys())
-            filterable = set(
-                repo.get("retrieval_config", {}).get("filterable_fields", [])
-            )
-            repo_skipped = sorted(all_requested - filterable)
-            filter_desc = normalised_filter.describe()
-
-            bound_log.debug(
-                "retrieval.searching_repo",
-                repo_id=repo_id,
-                index=index_name,
-                filter=filter_desc,
-            )
-
-            try:
-                # Read hybrid search config
-                # hybrid_search_enabled + hybrid_alpha → retrieval_config (generic)
-                # search_index_name + collection_name  → vector_config (provider-specific, Atlas)
-                retrieval_cfg = repo.get("retrieval_config", {})
-                vector_cfg = repo.get("vector_config", {})
-
-                hybrid_enabled = retrieval_cfg.get("hybrid_search_enabled", False)
-                hybrid_alpha = retrieval_cfg.get("hybrid_alpha", 0.7)
-                search_index = (
-                    vector_cfg.get("search_index_name") or f"sidx_repo_{repo_id}"
-                )
-                # Three-tier collection routing — resolved at repo creation,
-                # stored in vector_config.collection_name
-                collection_name = vector_cfg.get("collection_name") or "vector_store"
-
-                results = await self._vector_store.search(
-                    question_vector=question_vector,
-                    normalised_filter=normalised_filter,
-                    index_name=index_name,
-                    top_k=vector_top_k,
-                    # Hybrid search params — ignored if hybrid_search_enabled=False
-                    question=question,
-                    hybrid_search_enabled=hybrid_enabled,
-                    hybrid_alpha=hybrid_alpha,
-                    search_index_name=search_index,
-                    # Collection routing — three-tier isolation
-                    collection_name=collection_name,
-                )
-                # Convert SearchResult objects to dicts
-                chunks = [r.to_dict() for r in results]
-                bound_log.debug(
-                    "retrieval.repo_results",
-                    repo_id=repo_id,
-                    count=len(chunks),
-                )
-                return chunks, repo_skipped
-            except Exception as e:
-                # Graceful degradation — log and skip failed repo
-                bound_log.warning(
-                    "retrieval.repo_search_failed",
-                    repo_id=repo_id,
-                    error=str(e),
-                )
-                return [], repo_skipped
-
-        # Run all repo searches concurrently
-        repo_results = await asyncio.gather(*[search_repo(repo) for repo in repos])
-
-        # ── Step 5: Merge + rank + return top_k ──────────────────────────────
-        all_chunks: list[dict] = []
-        all_skipped: set[str] = set()
-        for chunks, skipped in repo_results:
-            all_chunks.extend(chunks)
-            all_skipped.update(skipped)
-
-        # Sort by vector score descending
-        all_chunks.sort(key=lambda c: c.get("score", 0), reverse=True)
-
-        # ── Step 6: Rerank ────────────────────────────────────────────────────
-        # Vector similarity ranks by topic similarity — all chunks from the
-        # same application score similarly due to R6a prefix.
-        # Reranker reads (query + chunk) together and scores by answer relevance.
-        # Uses tenant's own LLM — no new API needed.
-        # Graceful degradation: if reranker fails → original vector ranking used.
-        final = await self._reranker.rerank(
-            question=question,
-            chunks=all_chunks,
-            top_k=top_k,
-            api_cfg=api_cfg,
-        )
-
-        bound_log.info(
-            "retrieval.search_complete",
-            total_candidates=len(all_chunks),
-            returned=len(final),
-            repos_searched=len(repos),
-        )
-        return final, sorted(all_skipped)
-
-    async def _auto_extract_filters(
-        self,
-        question: str,
-        repos: list[dict],
-        tenant_id: str,
-        api_cfg: ResolvedApiConfig,
-        filters: SearchFilters,
-    ) -> dict[str, str]:
-        """
-        Use LLM to extract content-dimension hints from question.
-        Narrows should_filters scope to specific value if detected.
-
-        Returns dict[str, str] — single values for should_filters fields.
-        Returns empty dict if nothing extracted or extraction fails.
-
-        Skips fields already in must_filters — those are hard boundaries.
-        Only tries to narrow should_filters fields.
-        """
-        # Skip fields already locked in must_filters
-        skip_fields = list(filters.must_filters.keys())
-
-        # Build known_values from should_filters scope
-        # Only extract for fields that are in should_filters
-        # Each repo contributes its own extractable fields
-        known_values: dict[str, list[str]] = {}
-
-        for repo in repos:
-            repo_extractable = repo.get("retrieval_config", {}).get(
-                "extractable_fields", []
-            )
-            if not repo_extractable:
-                continue
-
-            repo_id = repo["_id"]
-            for field in repo_extractable:
-                # Only extract for fields in should_filters scope
-                if field not in filters.should_filters:
-                    continue
-                # Skip fields already in must_filters
-                if field in skip_fields:
-                    continue
-
-                # Use should_filters values as known_values
-                # These are the ACTUAL allowed values for this user
-                # Much more accurate than querying vector_store
-                # (which might have values user can't access)
-                scope_values = filters.should_filters.get(field, [])
-                if scope_values:
-                    existing = known_values.get(field, [])
-                    merged = list(dict.fromkeys(existing + scope_values))
-                    known_values[field] = merged
-
-        if not known_values:
-            # Fall back to querying vector_store for known values
-            # Used when should_filters is empty but extractable_fields exist
-            for repo in repos:
-                repo_extractable = repo.get("retrieval_config", {}).get(
-                    "extractable_fields", []
-                )
-                if not repo_extractable:
-                    continue
-                repo_id = repo["_id"]
-                for field in repo_extractable:
-                    if field in skip_fields:
-                        continue
-                    values = await self._repo_repo.get_distinct_filter_values(
-                        tenant_id=tenant_id,
-                        field_name=field,
-                        repo_ids=[repo_id],
-                        repos=[repo],
+        # ── Call LLM ──────────────────────────────────────────────────────────
+        try:
+            llm = ChatOpenAI(**llm_kwargs)
+            messages = [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(
+                    content=(
+                        f"Document excerpts:\n\n{context}"
+                        f"\n\n---\n\nQuestion: {question}"
                     )
-                    if values:
-                        existing = known_values.get(field, [])
-                        merged = list(dict.fromkeys(existing + values))
-                        known_values[field] = merged
+                ),
+            ]
+            response = await llm.ainvoke(messages)
+            raw = response.content
 
-        if not known_values:
-            return {}
+            log.debug(
+                "llm_service.raw_response",
+                model=api_cfg.llm_model,
+                raw_len=len(raw),
+            )
 
-        all_extractable = set(known_values.keys())
+        except Exception as e:
+            log.error(
+                "llm_service.call_failed",
+                model=api_cfg.llm_model,
+                error=str(e),
+            )
+            raise LLMError(
+                f"Failed to generate answer using model '{api_cfg.llm_model}': {e}"
+            ) from e
 
-        extracted = await self._filter_extractor.extract(
-            question=question,
-            extractable_fields=list(all_extractable),
-            known_values=known_values,
-            api_cfg=api_cfg,
-            skip_fields=skip_fields,
+        # ── Parse structured JSON response ────────────────────────────────────
+        return self._parse_llm_response(
+            raw=raw,
+            num_chunks=len(chunks),
+            model=api_cfg.llm_model,
         )
 
-        if not extracted:
-            return {}
+    def _parse_llm_response(
+        self,
+        raw: str,
+        num_chunks: int,
+        model: str,
+    ) -> LLMResult:
+        """
+        Parse the LLM's JSON response into a typed LLMResult.
 
-        # Validate extracted values are within should_filters scope
-        validated = {}
-        for field, value in extracted.items():
-            scope = filters.should_filters.get(field, [])
-            if scope and value not in scope:
-                # Out of scope — skip this extraction
-                log.debug(
-                    "retrieval.extraction_out_of_scope",
-                    field=field,
-                    extracted=value,
-                    scope_size=len(scope),
-                )
-                continue
-            validated[field] = value
+        Safety rules applied after parsing:
+          - used_chunk_indices clamped to valid range [0, num_chunks)
+          - answer coerced to None if answer_found is False
+          - Fallback on any parse error: plain text answer, no citation
 
-        return validated
+        Args:
+            raw:        Raw string from LLM.
+            num_chunks: Length of the chunk list passed to the LLM.
+                        Used to guard against hallucinated out-of-range indices.
+            model:      Model name for log context only.
+
+        Returns:
+            LLMResult
+        """
+        # Strip markdown code fences if the LLM wrapped its JSON anyway
+        # (defensive — prompt says not to, but models sometimes do)
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            # Drop first line (``` or ```json) and last line (```)
+            cleaned = "\n".join(lines[1:-1]).strip()
+
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            log.warning(
+                "llm_service.json_parse_failed",
+                model=model,
+                error=str(exc),
+                raw_snippet=raw[:200],
+            )
+            # Fallback: return the raw text as the answer, no chunk attribution.
+            # Safe production choice — user gets an answer, no wrong citations.
+            return LLMResult(
+                answer=raw.strip() or None,
+                answer_found=bool(raw.strip()),
+                used_indices=[],
+                parse_failed=True,
+            )
+
+        # ── Extract fields with safe defaults ─────────────────────────────────
+        answer_found: bool = bool(data.get("answer_found", True))
+        raw_answer = data.get("answer")
+        raw_indices = data.get("used_chunk_indices", [])
+
+        # Coerce answer to None when answer_found is False
+        if not answer_found:
+            answer = None
+        else:
+            answer = str(raw_answer).strip() if raw_answer else None
+            # If LLM said answer_found=True but gave empty answer, correct it
+            if not answer:
+                answer_found = False
+
+        # Guard: only keep indices that are valid integers within range
+        # Prevents IndexError if LLM hallucinates an out-of-range index
+        safe_indices: list[int] = []
+        if isinstance(raw_indices, list):
+            for idx in raw_indices:
+                if isinstance(idx, int) and 0 <= idx < num_chunks:
+                    safe_indices.append(idx)
+                else:
+                    log.warning(
+                        "llm_service.invalid_chunk_index",
+                        model=model,
+                        index=idx,
+                        num_chunks=num_chunks,
+                    )
+
+        # Deduplicate and preserve order
+        seen: set[int] = set()
+        deduped_indices: list[int] = []
+        for idx in safe_indices:
+            if idx not in seen:
+                deduped_indices.append(idx)
+                seen.add(idx)
+
+        log.debug(
+            "llm_service.answer_parsed",
+            model=model,
+            answer_found=answer_found,
+            cited_chunks=len(deduped_indices),
+            answer_len=len(answer) if answer else 0,
+        )
+
+        return LLMResult(
+            answer=answer,
+            answer_found=answer_found,
+            used_indices=deduped_indices,
+        )
