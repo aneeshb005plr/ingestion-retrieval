@@ -3,17 +3,27 @@ REST API routes for the Retrieval Service.
 
 Endpoints:
   POST /api/v1/{tenant_id}/search  → vector search, returns ranked chunks
-  POST /api/v1/{tenant_id}/query   → RAG, returns LLM answer + source chunks
+  POST /api/v1/{tenant_id}/query   → RAG, returns LLM answer + cited chunks only
   GET  /api/v1/{tenant_id}/repos   → list active repos for tenant
 
 All routes are tenant-scoped via path param.
 Ocelot handles authentication — tenant_id is trusted from the path.
+
+── Query endpoint change (R7) ───────────────────────────────────────────────
+Before R7:
+  - LLM received all top_k chunks and returned a plain text answer
+  - All chunks were returned in the response regardless of LLM usage
+
+After R7:
+  - LLM receives numbered chunks and returns structured JSON
+  - Response includes ONLY chunks the LLM cited (used_chunk_indices)
+  - answer_available=False → answer=None, chunks=[]
+  - parse_failed fallback → answer=raw text, chunks=[] (safe, logged)
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
-from typing import Annotated
-from fastapi import Depends
 
 from app.api.dependencies import RetrievalServiceDep
 from app.core.api_config import resolve_api_config
@@ -25,8 +35,6 @@ from app.core.exceptions import (
     VectorSearchError,
     LLMError,
 )
-from app.repositories.tenant_repo import TenantRepository
-from app.repositories.repo_repo import RepoRepository
 from app.schemas.requests import SearchRequest, QueryRequest
 from app.schemas.responses import (
     SearchResponse,
@@ -78,7 +86,6 @@ async def search(
     svc: RetrievalServiceDep,
 ) -> SearchResponse:
     try:
-        # Explicit tenant validation — raises TenantNotFoundError / TenantInactiveError
         await svc._tenant_repo.get_by_id(tenant_id)
 
         chunks, skipped_filters = await svc.search(
@@ -107,10 +114,12 @@ async def search(
 @router.post(
     "/{tenant_id}/query",
     response_model=QueryResponse,
-    summary="RAG query — returns LLM answer + source chunks",
+    summary="RAG query — returns LLM answer + cited chunks only",
     description=(
-        "Retrieves relevant chunks via vector search, then passes them as context "
-        "to the tenant's configured LLM to generate a grounded answer."
+        "Retrieves relevant chunks via vector search, then passes them as numbered "
+        "context to the tenant's LLM. Returns a structured answer with only the "
+        "chunks the LLM actually cited. When the answer is not available in the "
+        "documents, answer_available=False and chunks=[]."
     ),
 )
 async def query(
@@ -119,8 +128,10 @@ async def query(
     svc: RetrievalServiceDep,
 ) -> QueryResponse:
     try:
-        # Step 1 — retrieve chunks
-        chunks, _ = await svc.search(
+        bound_log = log.bind(tenant_id=tenant_id)
+
+        # ── Step 1: Retrieve + rerank chunks ─────────────────────────────────
+        chunks, skipped_filters = await svc.search(
             question=body.question,
             tenant_id=tenant_id,
             filters=body.filters,
@@ -128,27 +139,53 @@ async def query(
             repo_ids=body.repo_ids,
         )
 
-        # Step 2 — resolve tenant api_config for LLM call
+        # ── Step 2: Resolve tenant api_config for LLM ────────────────────────
         tenant = await svc._tenant_repo.get_by_id(tenant_id)
         api_cfg = await resolve_api_config(
             tenant_api_config=tenant.get("api_config"),
             tenant_ingestion_defaults=tenant.get("ingestion_defaults", {}),
         )
 
-        # Step 3 — generate answer
+        # ── Step 3: Generate structured answer ───────────────────────────────
+        # LLMService returns a typed LLMResult with:
+        #   answer        — text or None
+        #   answer_found  — bool
+        #   used_indices  — 0-based indices into `chunks`
+        #   parse_failed  — True if JSON from LLM was malformed (fallback used)
         llm_svc = LLMService()
-        answer = await llm_svc.generate_answer(
+        result = await llm_svc.generate_answer(
             question=body.question,
             chunks=chunks,
             api_cfg=api_cfg,
         )
 
+        # ── Step 4: Build cited chunk list ────────────────────────────────────
+        # Filter the full chunk list to only those the LLM cited.
+        # When answer_found=False or parse_failed → cited = [] (no attribution).
+        # Index safety: used_indices are already clamped in LLMService._parse_llm_response.
+        if result.answer_found and not result.parse_failed:
+            cited_chunks = [chunks[i] for i in result.used_indices]
+        else:
+            cited_chunks = []
+
+        bound_log.info(
+            "query.completed",
+            answer_available=result.answer_found,
+            chunks_retrieved=len(chunks),
+            chunks_cited=len(cited_chunks),
+            parse_failed=result.parse_failed,
+        )
+
+        # ── Step 5: Build response ────────────────────────────────────────────
         return QueryResponse(
             question=body.question,
-            answer=answer,
-            chunks=[ChunkResponse.from_dict(c) for c in chunks],
-            total_chunks=len(chunks),
+            answer=result.answer,
+            answer_available=result.answer_found,
+            chunks=[ChunkResponse.from_dict(c) for c in cited_chunks],
+            cited_chunks=len(cited_chunks),
+            skipped_filters=skipped_filters,
         )
+
     except Exception as e:
         _handle_domain_error(e, tenant_id)
 
@@ -167,7 +204,6 @@ async def list_repos(
     svc: RetrievalServiceDep,
 ) -> ReposResponse:
     try:
-        # Verify tenant exists first
         await svc._tenant_repo.get_by_id(tenant_id)
 
         repos = await svc._repo_repo.list_for_tenant(tenant_id)
